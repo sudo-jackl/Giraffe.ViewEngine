@@ -1,6 +1,9 @@
 module Giraffe.ViewEngine.Tests
 
 open System
+open System.IO
+open System.IO.Pipelines
+open System.Threading.Tasks
 open Xunit
 open Giraffe.ViewEngine
 
@@ -56,3 +59,29 @@ let ``Void tag in XML should be self closing tag`` () =
 let ``Void tag in HTML should be unary tag`` () =
     let unary =  br [] |> RenderView.AsString.htmlNode
     Assert.Equal("<br>", unary)
+
+[<Fact>]
+let ``Async render should produce the same result`` (): Task =
+    let asyncText = Task.FromResult "Async Header"
+    let nested =
+        div [] [
+            comment "this is a test"
+            asyncNode <|
+                task {
+                    let! text = asyncText
+                    return h1 [] [ str text ]
+                }
+            p [] [
+                rawText "Lorem "
+                strong [] [ str "Ipsum" ]
+                str " dollar"
+        ] ]
+    let htmlExpected =
+        nested
+        |> RenderView.AsString.xmlNode
+        |> removeNewLines
+
+    task {
+        let! htmlGot = AsyncViewWriter.debugWriteToString(nested)
+        Assert.Equal(htmlExpected, htmlGot)
+    }

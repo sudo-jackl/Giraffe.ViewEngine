@@ -15,6 +15,8 @@
 
 namespace Giraffe.ViewEngine
 
+open System.Threading.Tasks
+
 // ---------------------------
 // Default HTML elements
 // ---------------------------
@@ -41,6 +43,7 @@ module HtmlElements =
         | ParentNode  of XmlElement * XmlNode list // An XML element which contains nested XML elements
         | VoidElement of XmlElement                // An XML element which cannot contain nested XML (e.g. <hr /> or <br />)
         | Text        of string                    // Text content
+        | AsyncNode   of XmlNode Task              // Asynchronously rendered element
 
     // ---------------------------
     // Helper functions
@@ -92,6 +95,11 @@ module HtmlElements =
     /// The `strf` function will output the result from `sprintf fmt` as `encodedText`.
     /// </summary>
     let strf fmt = Printf.kprintf encodedText fmt
+
+    /// <summary>
+    /// Create an asynchronously generated node
+    /// </summary>
+    let asyncNode = AsyncNode
 
     // ---------------------------
     // Default HTML elements
@@ -550,25 +558,25 @@ module internal ViewBuilder =
     let inline internal (+=) (sb : StringBuilder) (text : string) = sb.Append(text)
     let inline internal (+!) (sb : StringBuilder) (text : string) = sb.Append(text) |> ignore
 
-    let inline private selfClosingBracket (isHtml : bool) =
+    let inline internal selfClosingBracket (isHtml : bool) =
         if isHtml then ">" else " />"
 
+    let internal buildElement sb closingBracket struct(elemName, attributes : XmlAttribute list) =
+        match attributes with
+        | [] -> do sb += "<" += elemName +! closingBracket
+        | _    ->
+            do sb += "<" +! elemName
+
+            attributes
+            |> List.iter (fun attr ->
+                match attr with
+                | KeyValue (k, v) -> do sb += " " += k += "=\"" += v +! "\""
+                | Boolean k       -> do sb += " " +! k)
+
+            do sb +! closingBracket
+
     let rec internal buildNode (isHtml : bool) (sb : StringBuilder) (node : XmlNode) : unit =
-
-        let buildElement closingBracket struct(elemName, attributes : XmlAttribute list) =
-            match attributes with
-            | [] -> do sb += "<" += elemName +! closingBracket
-            | _    ->
-                do sb += "<" +! elemName
-
-                attributes
-                |> List.iter (fun attr ->
-                    match attr with
-                    | KeyValue (k, v) -> do sb += " " += k += "=\"" += v +! "\""
-                    | Boolean k       -> do sb += " " +! k)
-
-                do sb +! closingBracket
-
+        let buildElement = buildElement sb
         let inline buildParentNode struct(elemName, attributes : XmlAttribute list) (nodes : XmlNode list) =
             do buildElement ">" (elemName, attributes)
             for node in nodes do buildNode isHtml sb node
@@ -578,6 +586,7 @@ module internal ViewBuilder =
         | Text text             -> do sb +! text
         | ParentNode (e, nodes) -> do buildParentNode e nodes
         | VoidElement e         -> do buildElement (selfClosingBracket isHtml) e
+        | AsyncNode task        -> do buildNode isHtml sb (task.GetAwaiter().GetResult()) // only for compatibility
 
 // ---------------------------
 // Render HTML/XML views
@@ -682,3 +691,69 @@ module RenderView =
             let sb = StringBuilderPool.Rent()
             IntoStringBuilder.htmlDocument sb document
             outputAsBytes sb
+
+[<RequireQualifiedAccess>]
+module AsyncViewWriter =
+    open System
+    open System.Buffers
+    open System.Text
+    open System.IO
+    open System.IO.Pipelines
+
+    let internal writeToPipeAsync (isHtml: bool) (pipe: IBufferWriter<byte>) (root : XmlNode): Task =
+        let sb = StringBuilder()
+
+        // Write as much to string builder before encountering an async node
+        // At an async node, flush -> run async then flush -> continue
+        let rec write node: Task =
+            let buildElement = buildElement sb
+            let buildParentNode (struct(elemName, _) as elem) (nodes : XmlNode list) =
+                do buildElement ">" elem
+                task {
+                    for node in nodes do
+                        do! write node
+                    do sb += "</" += elemName +! ">"
+                } :> Task
+
+            let flush() =
+                if sb.Length > 0 then
+                    let current = sb.ToString()
+                    let bytes = Encoding.UTF8.GetBytes(current)
+                    do pipe.Write(bytes.AsSpan())
+                    do sb.Clear() |> ignore
+                else ()
+
+            flush()
+            task {
+                do!
+                    match node with
+                    | Text text -> sb +! text; Task.CompletedTask
+                    | VoidElement e ->
+                        buildElement (selfClosingBracket isHtml) e; Task.CompletedTask
+                    | ParentNode (e, nodes) ->
+                        buildParentNode e nodes
+                    | AsyncNode asyncNode ->
+                        task {
+                            let! node = asyncNode
+                            do! write node
+                        }
+                do flush()
+            }
+
+        write root
+
+    let public writeHtmlAsync: IBufferWriter<byte> -> XmlNode -> Task = writeToPipeAsync true
+    let public writeXml: IBufferWriter<byte> -> XmlNode -> Task = writeToPipeAsync false
+
+    let debugWriteToString (node: XmlNode): string Task =
+        let pipe = Pipe()
+        task {
+            do! writeHtmlAsync pipe.Writer node
+            let! _ = pipe.Writer.FlushAsync()
+            do! pipe.Writer.CompleteAsync()
+
+            use resultStream = pipe.Reader.AsStream()
+            use streamReader = new StreamReader(resultStream)
+            let! result = streamReader.ReadToEndAsync()
+            return result
+        }
